@@ -22,13 +22,14 @@
 ## 1. 项目概述
 
 - **名称**：IM Sidebar（IM 侧边栏助手；仓库目录名沿用 `wechat-sidebar`）
-- **目标 IM**：**QQ NT 9.9.31**（2026-10-20 起微信替换为 QQ，微信 4.x 无可用采集方案，见 §7.4）
-- **一句话描述**：贴在 Windows QQ 窗口右侧的无焦点浮窗，读取消息交给大模型生成回复建议，人工确认后一键填入或发送。
+- **目标 IM**：QQ NT 9.9.31 与微信 4.x；顶部可手选，也可自动选择当前前台 IM。
+- **一句话描述**：贴在 Windows QQ 或微信窗口旁的浮窗，读取消息交给大模型生成回复建议，人工确认后一键填入或发送。
 - **目标用户**：本机自用、有 Python 基础但**不写前端/后端**的个人使用者；用于学习 Windows UI 自动化 + LLM 应用。
-- **核心功能（仅 3 条，超出即属违规）**
+- **核心功能**
   1. **收**：读取当前 QQ 会话的最近消息（QQ NT 无控件树 → **走剪贴板**；可选开启实时监听）
   2. **想**：调用大模型生成一条可直接发送的中文回复建议（LLM 不可用时规则兜底）
   3. **发**：一键粘贴到 QQ 输入框，或粘贴并回车发送（**必须人工点击**）
+  4. **产品库**：本地管理产品资料，检索后作为回复依据；发送仍须人工点击
 
 ---
 
@@ -41,14 +42,20 @@
 | Web 框架 | FastAPI | `0.151.0` | |
 | ASGI 服务器 | uvicorn | `0.54.0` | 仅本地回环 `127.0.0.1` |
 | HTTP 客户端 | httpx | `0.28.1` | 调 LLM 用，超时 30s |
-| IM 采集 | **`qq_adapter`（QQ NT 半自动）** / wxauto | 内置 | QQ 走剪贴板+窗口激活，**零新增依赖**（只用 pywin32）；wxauto 不在 PyPI，仅支持微信 3.9.11.17，本机 4.1.15.13 用不上 |
+| IM 采集 | `qq_adapter` / `wechat4_adapter` / wxauto | 内置 | QQ 与微信 4.x 用本地 RapidOCR 识别截图；wxauto 仅兼容微信 3.9.11.17 |
+| 本地截图 OCR | rapidocr-onnxruntime | `>=1.2.3,<2` | QQ、微信 4.x 聊天区识别；模型随便携包打入，截图只在本机处理 |
 | Windows API | pywin32 | `312` | 窗口句柄、贴边、无焦点 |
 | 数据库 | SQLite | 内置（Python 3.14 自带 sqlite3） | 不装任何数据库服务 |
+| 文档解析（产品库可选依赖） | MinerU | `>=4.0,<5` | 本地解析 PDF/图片/Office；扫描件 OCR；首次用到时需下载本地模型，不上传资料 |
+| PDF 原生解析 | PyMuPDF / pypdf | `>=1.26,<2` / `>=6,<7` | PDF 文字与页面坐标；无 OCR 时识别扫描件并提示 |
+| Office 读取 | python-docx / python-pptx / openpyxl | `>=1.2,<2` / `>=1.0,<2` / `>=3.1,<4` | 本地文本和表格提取 |
 | ORM | 不使用 | — | 直接写 SQL；SQLModel 属**未批准**依赖，需先改本文档 |
 | LLM | DeepSeek | `deepseek-chat` | OpenAI 兼容协议 |
 | 打包 | PyInstaller | **待安装，版本未锁定** | MVP 阶段不做打包，直接源码运行 |
 
 **已废弃（下个任务删除，不得再修改）**：`web/`（React + Vite）、`src-tauri/`（Tauri 2 壳）、`backend/launcher.py`（pywebview 启动器）。
+
+产品库文档解析依赖单独安装：在 `backend` 目录执行 `python -m pip install -r requirements-products.txt`。MinerU 使用本地模式，扫描 PDF/图片首次解析时会下载模型文件到 MinerU 本地缓存；绝不启用远程解析。
 
 ---
 
@@ -190,6 +197,22 @@ Query：`who`（string，可选，缺省用当前会话）、`limit`（int，默
 - `DELETE /api/quick-replies/{id}` → `data: { "deleted": true, "items": [...] }`；id 不存在返回 `4001`
 - **不做编辑**（grill 决策：要改就删了重加）
 
+### 4.13 产品库（V4，本地资料 RAG）
+
+- `GET /api/products` → `data: {"items":[{"id","name","category","summary","created_at","document_count"}]}`
+- `POST /api/products` ← `{ "name", "category"?, "summary"? }` → 新建产品并返回列表；名称不能为空。
+- `PUT /api/products/{id}` ← `{ "name"?, "category"?, "summary"? }` → 更新产品；不存在返回 `4001`。
+- `DELETE /api/products/{id}` → 删除产品记录及仅由产品库管理的资料副本；不得触碰原导入目录。
+- `GET /api/products/{id}/documents` → `data: {"items":[{"id","name","summary","status","error","relative_path","chunk_count","created_at"}]}`
+- `POST /api/products/{id}/documents/import` ← `{ "source_dir": "用户选择的文件夹或单个文件路径" }` → 文件夹递归导入，单文件直接导入；本地复制原件至 `data/products/{id}/raw/`，生成处理文档、SQLite 记录及检索片段，返回逐文件结果。不得向外部服务上传资料。
+- 产品库资料列表支持拖放文件或文件夹导入；未选中产品时，桌面端按拖入目录名或文件名创建产品后再导入。
+- `DELETE /api/products/{id}/documents/{doc_id}` → 删除产品库副本及索引，不删除导入源目录中的原件。
+- `POST /api/reply` 可选接收 `product_id`；提供时只从该产品资料检索文字片段，作为依据交给当前纯文本模型；响应增加 `product_sources: [{document_name,page,section,excerpt}]`。
+- 未支持的文件只保留在 RAW 附件层，不索引。导入需报告逐文件处理状态。
+- PDF 页眉页脚按每份 PDF 的实际版面确定顶部/底部范围；只移除判定为页眉页脚的内容，正文保持原样；页码保留为来源元数据。无法确定时保留原文并提示复核。
+- 图片、扫描 PDF 用本地 OCR；表格转换为保留表头的 Markdown。图表 OCR 不等于趋势理解，无法可靠文字化的图表标记待补充说明，不臆测内容。
+- 文本按标题、章节、段落递归切分；每个片段均关联原文件及页码/章节来源。
+
 ---
 
 ## 5. 统一响应格式
@@ -275,6 +298,45 @@ Query：`who`（string，可选，缺省用当前会话）、`limit`（int，默
 | `key` | TEXT | PRIMARY KEY | 如 `llm_model`、`sidebar_width` |
 | `value` | TEXT | | 字符串形式存储 |
 
+### 6.5 `products` — 产品目录
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | INTEGER | PRIMARY KEY AUTOINCREMENT | |
+| `name` | TEXT | NOT NULL | 产品名称 |
+| `category` | TEXT | NOT NULL DEFAULT '' | 产品分类 |
+| `summary` | TEXT | NOT NULL DEFAULT '' | 产品摘要 |
+| `created_at` | TEXT | NOT NULL | UTC ISO8601 |
+| `updated_at` | TEXT | NOT NULL | UTC ISO8601 |
+
+### 6.6 `product_documents` — 原始资料索引
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | INTEGER | PRIMARY KEY AUTOINCREMENT | |
+| `product_id` | INTEGER | NOT NULL, FK→`products.id` ON DELETE CASCADE | |
+| `name` | TEXT | NOT NULL | 原文件名 |
+| `relative_path` | TEXT | NOT NULL | RAW 相对路径 |
+| `processed_path` | TEXT | NOT NULL DEFAULT '' | 派生 Markdown 相对路径 |
+| `summary` | TEXT | NOT NULL DEFAULT '' | 资料摘要/检索入口 |
+| `status` | TEXT | NOT NULL | `indexed` / `raw_only` / `needs_review` / `error` |
+| `error` | TEXT | NOT NULL DEFAULT '' | 用户可读处理状态 |
+| `sha256` | TEXT | NOT NULL DEFAULT '' | 重复导入识别 |
+| `created_at` | TEXT | NOT NULL | UTC ISO8601 |
+
+### 6.7 `product_chunks` — RAG 文本片段
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | INTEGER | PRIMARY KEY AUTOINCREMENT | |
+| `document_id` | INTEGER | NOT NULL, FK→`product_documents.id` ON DELETE CASCADE | |
+| `product_id` | INTEGER | NOT NULL, FK→`products.id` ON DELETE CASCADE | |
+| `chunk_index` | INTEGER | NOT NULL | 文档内顺序 |
+| `content` | TEXT | NOT NULL | 可检索文字 |
+| `page_start` | INTEGER | | 原文起始页（1-based） |
+| `page_end` | INTEGER | | 原文结束页（1-based） |
+| `section` | TEXT | NOT NULL DEFAULT '' | 标题路径 |
+| `created_at` | TEXT | NOT NULL | UTC ISO8601 |
+
+索引：`product_documents(product_id, created_at)`；`product_chunks(product_id, document_id, chunk_index)`。
+
 ---
 
 ## 7. 架构约束与非目标
@@ -297,11 +359,11 @@ Query：`who`（string，可选，缺省用当前会话）、`limit`（int，默
 2. **不做多账号 / 多开 / 多用户 / 权限**：单 IM 实例、单用户、单机。
 3. **不做云端化**：不部署服务器、不打包 Docker、不做 Web 控制台、不做移动端、不做远程访问。
 4. **不做注入 / Hook / 协议逆向 / 读 IM 本地数据库**：只用 UI 自动化 + 剪贴板。
-   - 本机微信为 **4.1.15.13**，wxauto 只支持 3.9.11.17 → **目标 IM 已于 2026-10-20 切换为 QQ NT 9.9.31**
+   - 本机微信为 **4.1.15.13**，wxauto 只支持 3.9.11.17；微信 4.x 通过截图 OCR 适配，不注入、不读私有数据库。
    - QQ NT 无控件树（UIA 元素 2 个、子窗口仅 1 个 D3D 面）→ 走 `adapters/qq_adapter.py` **半自动方案**：
      读消息取剪贴板，发送 = 写剪贴板 + 激活窗口 + Ctrl+V(+Enter)
-   - 微信 4.x Adapter 在"能登录微信并实测"之前不得写入仓库（无法验证的代码不入库）
-5. **不做 RAG / 知识库 / 插件系统 / 多轮长期记忆 / 图片语音识别 / 消息全文检索 UI**：MVP 只有"收 → 想 → 发"。
+   - 微信 4.x OCR 适配器已实现；**实机验证必须在微信窗口还原且可见时进行**，未完成实机观察前不能宣称完整链路已验收。
+5. **不做插件系统 / 多轮长期记忆 / 聊天消息全文检索 UI**。产品资料 RAG 是用户明确新增的本地功能，按 §4.13、§6.5 实施。
 
 ---
 
@@ -317,6 +379,9 @@ python -m pip install git+https://github.com/cluic/wxauto.git
 
 # 3) 安装 UI
 python -m pip install PySide6==6.12.0
+
+# 3a) 产品库文档解析（本地；首次 OCR/图表处理会下载 MinerU 模型）
+python -m pip install -r requirements-products.txt
 
 # 4) 启动后端（终端 A，保持运行）
 cd backend
@@ -370,7 +435,7 @@ QQ 模式读消息依赖剪贴板：在 QQ 里选中对方的话 Ctrl+C，侧边
 
 **待办（按顺序）**：
 1. 人工验收 §11 的 5 条标准（**需真人在 QQ 上操作**，AI 无法自测）
-2. （可选）将来要支持微信时：新增 `adapters/wechat4_adapter.py`，UI 与业务代码不动
+2. 在可见微信 4.x 窗口上验收裁切、白色气泡过滤、实时去重和回复填入；发送仍须用户明确点击
 
 **QQ 探测结论（2026-10-20）**：本机 QQ NT 9.9.31（`C:\Program Files\Tencent\QQNT\QQ.exe`）
 窗口类名 `Chrome_WidgetWin_1`，**UIA 子树只有 2 个元素、子窗口只有 1 个 `Intermediate D3D Window`**
@@ -393,6 +458,7 @@ python -m PyInstaller packaging/build.spec --noconfirm --clean
 - **数据与日志**：exe 同目录下 `data/sidebar.db`、`logs/app.log`
 - **不签名**：无证书，Windows SmartScreen 会弹"未知发布者"，点"更多信息 → 仍要运行"即可
 - 新增依赖后要同步 `packaging/build.spec` 里的 `hiddenimports`（尤其 uvicorn 的运行时模块是动态导入）
+- 产品库的 MinerU/OCR 依赖不打进当前便携 EXE；源码环境需单独安装 `backend/requirements-products.txt`，首次解析时需本机可下载模型。
 
 ## 11. 验收标准（必须真人手动验证，AI 无法自测）
 

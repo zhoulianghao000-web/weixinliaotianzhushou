@@ -56,6 +56,7 @@ class ReplyIn(BaseModel):
     who: str | None = None
     instruction: str = ''
     messages: list[dict] | None = None
+    product_id: int | None = Field(default=None, ge=1)
 
 
 class SendIn(BaseModel):
@@ -84,6 +85,22 @@ class SettingsIn(BaseModel):
 class QuickReplyIn(BaseModel):
     tag: str = ''
     content: str
+
+
+class ProductIn(BaseModel):
+    name: str
+    category: str = ''
+    summary: str = ''
+
+
+class ProductUpdateIn(BaseModel):
+    name: str | None = None
+    category: str | None = None
+    summary: str | None = None
+
+
+class ProductFolderImportIn(BaseModel):
+    source_dir: str
 
 
 class MessageOut(BaseModel):

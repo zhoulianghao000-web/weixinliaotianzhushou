@@ -1,6 +1,6 @@
 """SQLite 数据访问层（CLAUDE.md §6 数据模型）。
 
-4 张表：chats / messages / quick_replies / settings
+7 张表：chats / messages / quick_replies / settings / products / product_documents / product_chunks
 时间统一存 UTC ISO8601 字符串；消息写入用 INSERT OR IGNORE 做 id 去重。
 
 自检：`python db.py`  → 建表 + 写入种子数据（幂等）
@@ -51,6 +51,47 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS products (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    category   TEXT NOT NULL DEFAULT '',
+    summary    TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS product_documents (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id     INTEGER NOT NULL,
+    name           TEXT NOT NULL,
+    relative_path  TEXT NOT NULL,
+    processed_path TEXT NOT NULL DEFAULT '',
+    summary        TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL,
+    error          TEXT NOT NULL DEFAULT '',
+    sha256         TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_documents_product ON product_documents(product_id, created_at);
+
+CREATE TABLE IF NOT EXISTS product_chunks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL,
+    product_id  INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    content     TEXT NOT NULL,
+    page_start  INTEGER,
+    page_end    INTEGER,
+    section     TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (document_id) REFERENCES product_documents(id) ON DELETE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_chunks_product ON product_chunks(product_id, document_id, chunk_index);
 """
 
 
@@ -63,6 +104,7 @@ def connect() -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA foreign_keys = ON')
     return conn
 
 
@@ -189,6 +231,215 @@ def get_setting(key: str, default: str | None = None) -> str | None:
     with connect() as conn:
         row = conn.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
     return row['value'] if row else default
+
+
+# ---------------- products / product documents / RAG chunks ----------------
+def create_product(name: str, category: str = '', summary: str = '') -> dict:
+    now = now_iso()
+    with connect() as conn:
+        cur = conn.execute(
+            'INSERT INTO products (name, category, summary, created_at, updated_at) VALUES (?,?,?,?,?)',
+            (name.strip(), category.strip(), summary.strip(), now, now),
+        )
+        row = conn.execute('SELECT * FROM products WHERE id = ?', (cur.lastrowid,)).fetchone()
+        conn.commit()
+    return dict(row)
+
+
+def get_product(product_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute('SELECT * FROM products WHERE id = ?', (product_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_products() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            '''SELECT p.*, COUNT(d.id) AS document_count
+               FROM products p LEFT JOIN product_documents d ON d.product_id = p.id
+               GROUP BY p.id ORDER BY p.updated_at DESC, p.id DESC'''
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_product(product_id: int, *, name: str | None = None,
+                   category: str | None = None, summary: str | None = None) -> dict | None:
+    product = get_product(product_id)
+    if product is None:
+        return None
+    values = {
+        'name': product['name'] if name is None else name.strip(),
+        'category': product['category'] if category is None else category.strip(),
+        'summary': product['summary'] if summary is None else summary.strip(),
+    }
+    if not values['name']:
+        return None
+    with connect() as conn:
+        conn.execute(
+            'UPDATE products SET name=?, category=?, summary=?, updated_at=? WHERE id=?',
+            (values['name'], values['category'], values['summary'], now_iso(), product_id),
+        )
+        row = conn.execute('SELECT * FROM products WHERE id=?', (product_id,)).fetchone()
+        conn.commit()
+    return dict(row) if row else None
+
+
+def delete_product(product_id: int) -> bool:
+    with connect() as conn:
+        cur = conn.execute('DELETE FROM products WHERE id=?', (product_id,))
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def add_product_document(product_id: int, *, name: str, relative_path: str,
+                         processed_path: str = '', summary: str = '', status: str = 'raw_only',
+                         error: str = '', sha256: str = '') -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            '''INSERT INTO product_documents
+               (product_id,name,relative_path,processed_path,summary,status,error,sha256,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)''',
+            (product_id, name, relative_path, processed_path, summary, status, error, sha256, now_iso()),
+        )
+        conn.execute('UPDATE products SET updated_at=? WHERE id=?', (now_iso(), product_id))
+        conn.commit()
+    return int(cur.lastrowid)
+
+
+def find_product_document_by_hash(product_id: int, sha256: str) -> dict | None:
+    if not sha256:
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            'SELECT * FROM product_documents WHERE product_id=? AND sha256=? LIMIT 1',
+            (product_id, sha256),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def update_product_document(document_id: int, *, processed_path: str | None = None,
+                            summary: str | None = None, status: str | None = None,
+                            error: str | None = None) -> None:
+    current = get_product_document(document_id)
+    if not current:
+        return
+    fields = {
+        'processed_path': current['processed_path'] if processed_path is None else processed_path,
+        'summary': current['summary'] if summary is None else summary,
+        'status': current['status'] if status is None else status,
+        'error': current['error'] if error is None else error,
+    }
+    with connect() as conn:
+        conn.execute(
+            'UPDATE product_documents SET processed_path=?,summary=?,status=?,error=? WHERE id=?',
+            (fields['processed_path'], fields['summary'], fields['status'], fields['error'], document_id),
+        )
+        conn.commit()
+
+
+def get_product_document(document_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute('SELECT * FROM product_documents WHERE id=?', (document_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_product_documents(product_id: int) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            '''SELECT d.*, COUNT(c.id) AS chunk_count
+               FROM product_documents d LEFT JOIN product_chunks c ON c.document_id=d.id
+               WHERE d.product_id=? GROUP BY d.id ORDER BY d.created_at DESC,d.id DESC''',
+            (product_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_product_document(product_id: int, document_id: int) -> dict | None:
+    document = get_product_document(document_id)
+    if not document or document['product_id'] != product_id:
+        return None
+    with connect() as conn:
+        conn.execute('DELETE FROM product_documents WHERE id=? AND product_id=?', (document_id, product_id))
+        conn.execute('UPDATE products SET updated_at=? WHERE id=?', (now_iso(), product_id))
+        conn.commit()
+    return document
+
+
+def replace_product_chunks(product_id: int, document_id: int, chunks: list[dict]) -> None:
+    with connect() as conn:
+        conn.execute('DELETE FROM product_chunks WHERE document_id=?', (document_id,))
+        conn.executemany(
+            '''INSERT INTO product_chunks
+               (document_id,product_id,chunk_index,content,page_start,page_end,section,created_at)
+               VALUES (?,?,?,?,?,?,?,?)''',
+            [
+                (document_id, product_id, i, item['content'], item.get('page_start'),
+                 item.get('page_end'), item.get('section') or '', now_iso())
+                for i, item in enumerate(chunks)
+            ],
+        )
+        conn.commit()
+
+
+def search_product_chunks(product_id: int, query: str, limit: int = 6) -> list[dict]:
+    """Local Unicode-aware fallback ranker; no remote embedding service is used."""
+    import re
+
+    if not query.strip():
+        return []
+    terms: list[str] = []
+    for token in re.findall(r'[a-z0-9]+|[\u3400-\u9fff]+', query.lower()):
+        if re.fullmatch(r'[\u3400-\u9fff]+', token):
+            if len(token) <= 3:
+                terms.append(token)
+            for n in (2, 3):
+                terms.extend(token[i:i+n] for i in range(max(0, len(token)-n+1)))
+        else:
+            terms.append(token)
+    terms = list(dict.fromkeys(term for term in terms if term))
+    if not terms:
+        terms = [query.strip().lower()]
+
+    with connect() as conn:
+        product = conn.execute('SELECT name,summary FROM products WHERE id=?', (product_id,)).fetchone()
+        rows = conn.execute(
+            '''SELECT c.id,c.document_id,c.product_id,c.content,c.page_start,c.page_end,c.section,
+                      d.name AS document_name,d.summary AS document_summary,d.relative_path
+               FROM product_chunks c JOIN product_documents d ON d.id=c.document_id
+               WHERE c.product_id=?''', (product_id,),
+        ).fetchall()
+    scored = []
+    if product and product['summary'].strip():
+        summary_text = product['summary'].strip()
+        score = sum(min(summary_text.lower().count(term), 3) * (2.0 if len(term) > 1 else 0.5) for term in terms)
+        if score:
+            scored.append({
+                'id': None, 'document_id': None, 'product_id': product_id,
+                'content': summary_text, 'page_start': None, 'page_end': None,
+                'section': '产品摘要', 'document_name': f"{product['name']}（产品摘要）",
+                'document_summary': summary_text, 'relative_path': '', 'score': score + 1.0,
+            })
+    for raw in rows:
+        row = dict(raw)
+        content = row['content'].lower()
+        summary = row['document_summary'].lower()
+        title = row['document_name'].lower()
+        score = 0.0
+        hits = 0
+        for term in terms:
+            count = content.count(term)
+            if count:
+                hits += 1
+                score += min(count, 3) * (2.0 if len(term) > 1 else 0.5)
+            if term in summary:
+                score += 1.6
+            if term in title:
+                score += 1.0
+        if score:
+            row['score'] = score + hits / max(1, len(terms))
+            scored.append(row)
+    scored.sort(key=lambda row: (row['score'], row.get('page_start') or 0), reverse=True)
+    return scored[:max(1, min(limit, 12))]
 
 
 # ---------------- 种子数据 ----------------

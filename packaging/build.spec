@@ -12,7 +12,7 @@
 """
 import os
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 # spec 里的相对路径是相对 spec 文件所在目录解析的，这里统一用绝对路径
 ROOT = os.path.abspath(os.path.join(SPECPATH, '..'))
@@ -31,6 +31,11 @@ hidden = [
     'adapters.mock_adapter',
     'adapters.qq_adapter',
     'adapters.wxauto_adapter',
+    'adapters.wechat4_adapter',
+    'rapidocr_onnxruntime',
+    'cv2',
+    'numpy',
+    'onnxruntime',
     # uvicorn 的运行时后端都是动态导入，必须显式列出
     'uvicorn',
     'uvicorn.lifespan.on',
@@ -56,21 +61,37 @@ hidden = [
     'httpx',
     'dotenv',
     'anyio._backends._asyncio',
-] + collect_submodules('starlette')
+] + collect_submodules('starlette') + collect_submodules('rapidocr_onnxruntime') \
+    + collect_submodules('onnxruntime')
+
+ocr_datas = collect_data_files('rapidocr_onnxruntime')
+ocr_binaries = collect_dynamic_libs('onnxruntime')
 
 a = Analysis(
     [os.path.join(ROOT, 'desktop', 'app.py')],
     pathex=[ROOT, os.path.join(ROOT, 'backend'), os.path.join(ROOT, 'desktop')],
-    binaries=[],
-    datas=[],
+    binaries=ocr_binaries,
+    datas=ocr_datas,
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'wxauto', 'pytest', 'numpy', 'PIL'],
+    excludes=['tkinter', 'wxauto', 'pytest'],
     noarchive=False,
     optimize=0,
 )
+
+# PyInstaller can resolve Qt's ICU dependency to the unrelated ICU runtime
+# bundled with the local Poppler toolchain. That build exports version-suffixed
+# symbols, while Qt6Core imports the Windows ICU C API under unsuffixed names;
+# bundling it makes PySide6.QtWidgets fail to load. Qt 6.12 supports Windows 10
+# 1809+, whose system ICU exposes those C APIs, so omit the conflicting files.
+_conflicting_icu = {'icuuc.dll', 'icudt78.dll'}
+a.binaries = [
+    entry for entry in a.binaries
+    if os.path.basename(entry[0]).lower() not in _conflicting_icu
+]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

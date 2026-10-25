@@ -30,6 +30,9 @@ from schemas import (  # noqa: E402
     ERR_WECHAT_UNAVAILABLE,
     DockIn,
     ListenIn,
+    ProductFolderImportIn,
+    ProductIn,
+    ProductUpdateIn,
     QuickReplyIn,
     ReplyIn,
     SendIn,
@@ -39,7 +42,8 @@ from schemas import (  # noqa: E402
     fail,
     ok,
 )
-from services import Docking, find_target_hwnd, generate_reply, llm_config  # noqa: E402
+from services import Docking, generate_reply, llm_config  # noqa: E402
+from services import product_library  # noqa: E402
 
 state: dict = {
     'adapter': None,
@@ -48,7 +52,26 @@ state: dict = {
     'listen': False,
 }
 
-VALID_ADAPTERS = ('qq', 'wxauto', 'mock', 'auto')
+# Screenshot OCR can take hundreds of milliseconds or more. Keep it off the
+# asyncio event loop so API responses and WebSocket control stay responsive;
+# serialize calls because each adapter reuses one OCR engine instance.
+_OCR_LOCK = asyncio.Lock()
+
+
+async def _adapter_messages(adapter, *, who: str | None = None, limit: int = 60):
+    if getattr(adapter, 'name', '') in {'qq', 'wechat4'}:
+        async with _OCR_LOCK:
+            return await asyncio.to_thread(adapter.messages, who=who, limit=limit)
+    return adapter.messages(who=who, limit=limit)
+
+
+async def _adapter_poll_new(adapter):
+    if getattr(adapter, 'name', '') in {'qq', 'wechat4'}:
+        async with _OCR_LOCK:
+            return await asyncio.to_thread(adapter.poll_new)
+    return adapter.poll_new()
+
+VALID_ADAPTERS = ('qq', 'wechat4', 'wxauto', 'mock', 'auto')
 
 
 def effective_adapter_name() -> str:
@@ -77,20 +100,60 @@ def settings_view() -> dict:
 
 
 def ensure_adapter():
-    if state['adapter'] is None:
-        state['adapter'] = create_adapter(effective_adapter_name())
+    preferred = effective_adapter_name()
+    if preferred == 'auto':
+        candidate = create_adapter('auto')
+        current = state['adapter']
+        if current is None:
+            state['adapter'] = candidate
+        elif current.name != candidate.name and candidate.status().get('client_running'):
+            # Auto follows the active IM. Switching targets invalidates the
+            # old chat baseline and stops listening/docking until re-enabled.
+            try:
+                current.close()
+            except Exception:
+                pass
+            dock = state.get('docking')
+            if dock:
+                try:
+                    dock.stop()
+                except Exception:
+                    pass
+                state['docking'] = None
+            state['listen'] = False
+            state['current'] = None
+            state['adapter'] = candidate
+        else:
+            try:
+                candidate.close()
+            except Exception:
+                pass
+    elif state['adapter'] is None or state['adapter'].name != preferred:
+        state['adapter'] = create_adapter(preferred)
     return state['adapter']
 
 
 def ensure_docking() -> Docking:
     if state['docking'] is None:
+        adapter = ensure_adapter()
+        target_class = config.TARGET_CLASS
+        target_title = config.TARGET_TITLE
+        if adapter.name == 'wechat4':
+            target_class = ''
+            target_title = '微信'
+        elif adapter.name == 'wxauto':
+            target_class = target_class or 'WeChatMainWndForPC'
+            target_title = '微信'
         state['docking'] = Docking(
             config.SIDEBAR_TITLE,
             width=effective_width(),
-            target_class=config.TARGET_CLASS,
-            target_title=config.TARGET_TITLE,
+            target_class=target_class,
+            target_title=target_title,
             # QQ 半自动模式：侧边栏要能拿到键盘焦点（让人填"补充要求"、改回复）
-            no_activate=(effective_adapter_name() != 'qq'),
+            # Only wxauto's legacy keyboard automation requires preserving
+            # focus in WeChat. QQ and WeChat 4.x use clipboard/window activation
+            # paths that allow the sidebar forms to stay editable.
+            no_activate=(adapter.name == 'wxauto'),
         )
     return state['docking']
 
@@ -141,15 +204,15 @@ async def status():
     try:
         a = ensure_adapter()
         d = ensure_docking()
-        wechat_running = False
-        try:
-            wechat_running = bool(find_target_hwnd(config.TARGET_CLASS, config.TARGET_TITLE))
-        except Exception:
-            pass
         st = a.status()
+        client_running = bool(st.get('client_running'))
+        if a.name == 'wxauto':
+            client_running = True
         st.update(
             {
-                'wechat_running': wechat_running,
+                'selected_adapter': effective_adapter_name(),
+                'client_running': client_running,
+                'wechat_running': client_running,
                 'docking': bool(d.running),
                 'docking_error': d.last_error,
                 'listen': state['listen'],
@@ -185,11 +248,16 @@ async def messages(who: str | None = None, limit: int | None = Query(default=Non
     if not who:
         return fail(ERR_NO_CHAT)
     try:
-        msgs = ensure_adapter().messages(who=who, limit=limit)
+        msgs = await _adapter_messages(ensure_adapter(), who=who, limit=limit)
     except Exception as e:
         return fail(ERR_READ_MESSAGE, f'{type(e).__name__}: {e}')
     try:
-        db.save_messages(who, msgs)
+        if msgs:
+            db.save_messages(who, msgs)
+        else:
+            # OCR can return no live text when the IM is closed, covered, or
+            # between frames. Keep the last captured conversation visible.
+            msgs = db.list_messages(who, limit=limit)
     except Exception:
         pass  # 落库失败不影响读取
     return ok({'who': who, 'messages': msgs})
@@ -204,10 +272,23 @@ async def reply(body: ReplyIn):
     msgs = body.messages
     if not msgs:
         try:
-            msgs = ensure_adapter().messages(who=who)
+            msgs = await _adapter_messages(ensure_adapter(), who=who)
         except Exception as e:
             return fail(ERR_READ_MESSAGE, f'{type(e).__name__}: {e}')
-    res = generate_reply(msgs or [], who, body.instruction)
+    product_sources = None
+    product_context = None
+    if body.product_id is not None:
+        product = db.get_product(body.product_id)
+        if not product:
+            return fail(ERR_BAD_PARAM, '所选产品不存在')
+        question = ' '.join(
+            str(message.get('content') or '').strip()
+            for message in (msgs or [])[-60:]
+            if message.get('type') == 'friend' and message.get('content')
+        )
+        product_context = product_library.product_context(body.product_id, question)
+        product_sources = product_context
+    res = generate_reply(msgs or [], who, body.instruction, product_context=product_context)
     if not res.get('reply'):
         return fail(ERR_LLM_FAILED, '大模型未返回内容')
     data = {
@@ -216,6 +297,11 @@ async def reply(body: ReplyIn):
         'source': res.get('source', 'rule'),
         'degraded': bool(res.get('error')),
     }
+    if body.product_id is not None:
+        data['product_sources'] = product_sources or []
+        data['product_context_used'] = bool(
+            data['product_sources'] and not res.get('error') and res.get('source', '').startswith('llm:')
+        )
     if res.get('error'):
         data['error'] = res['error']
         return degrade(data, res['error'])
@@ -313,10 +399,15 @@ async def ws_messages(ws: WebSocket):
         while True:
             if state['listen']:
                 try:
-                    new = ensure_adapter().poll_new()
+                    new = await _adapter_poll_new(ensure_adapter())
                 except Exception:
                     new = {}
                 if new:
+                    for chat, messages in new.items():
+                        try:
+                            db.save_messages(chat, messages)
+                        except Exception:
+                            pass
                     await ws.send_json({'type': 'new', 'data': new})
             await asyncio.sleep(2)
     except WebSocketDisconnect:
@@ -359,6 +450,10 @@ async def put_settings(body: SettingsIn):
         # 在途请求拿着旧实例自然跑完；自动关监听（换 IM 后需手动重开）；
         # 贴边线程停掉，下次 ensure_docking 按新 no_activate 重建。
         state['listen'] = False
+        # A target name belongs to one adapter. Keeping e.g. "QQ 当前窗口"
+        # after switching to WeChat makes WebSocket events for "微信当前窗口"
+        # look like messages from an unselected conversation and drops them.
+        state['current'] = None
         state['adapter'] = None
         d = state['docking']
         if d:
@@ -394,6 +489,77 @@ async def delete_quick_reply(qid: int):
     if not deleted:
         return fail(ERR_BAD_PARAM, f'话术不存在：{qid}')
     return ok({'deleted': True, 'items': db.list_quick_replies()})
+
+
+# ---------------- §4.13 产品库（V4，本地资料 RAG）----------------
+@app.get('/api/products')
+async def products():
+    return ok({'items': db.list_products()})
+
+
+@app.post('/api/products')
+async def create_product(body: ProductIn):
+    name = body.name.strip()
+    if not name:
+        return fail(ERR_BAD_PARAM, '产品名称不能为空')
+    item = db.create_product(name, body.category, body.summary)
+    return ok({'item': item, 'items': db.list_products()})
+
+
+@app.put('/api/products/{product_id}')
+async def update_product(product_id: int, body: ProductUpdateIn):
+    if body.name is not None and not body.name.strip():
+        return fail(ERR_BAD_PARAM, '产品名称不能为空')
+    item = db.update_product(
+        product_id,
+        name=body.name if 'name' in body.model_fields_set else None,
+        category=body.category if 'category' in body.model_fields_set else None,
+        summary=body.summary if 'summary' in body.model_fields_set else None,
+    )
+    if not item:
+        return fail(ERR_BAD_PARAM, '产品不存在或名称不能为空')
+    return ok({'item': item, 'items': db.list_products()})
+
+
+@app.delete('/api/products/{product_id}')
+async def delete_product(product_id: int):
+    try:
+        deleted = product_library.delete_product_copy(product_id)
+    except ValueError as exc:
+        return fail(ERR_BAD_PARAM, str(exc))
+    if not deleted:
+        return fail(ERR_BAD_PARAM, '产品不存在')
+    return ok({'deleted': True, 'items': db.list_products()})
+
+
+@app.get('/api/products/{product_id}/documents')
+async def product_documents(product_id: int):
+    if not db.get_product(product_id):
+        return fail(ERR_BAD_PARAM, '产品不存在')
+    return ok({'items': db.list_product_documents(product_id)})
+
+
+@app.post('/api/products/{product_id}/documents/import')
+async def import_product_documents(product_id: int, body: ProductFolderImportIn):
+    try:
+        result = await asyncio.to_thread(product_library.import_folder, product_id, body.source_dir)
+    except ValueError as exc:
+        return fail(ERR_BAD_PARAM, str(exc))
+    except Exception as exc:
+        return fail(ERR_INTERNAL, f'{type(exc).__name__}: {exc}')
+    result['items_in_library'] = db.list_product_documents(product_id)
+    return ok(result)
+
+
+@app.delete('/api/products/{product_id}/documents/{document_id}')
+async def delete_product_document(product_id: int, document_id: int):
+    try:
+        document = product_library.delete_document_copy(product_id, document_id)
+    except ValueError as exc:
+        return fail(ERR_BAD_PARAM, str(exc))
+    if not document:
+        return fail(ERR_BAD_PARAM, '资料不存在')
+    return ok({'deleted': True, 'items': db.list_product_documents(product_id)})
 
 
 if __name__ == '__main__':

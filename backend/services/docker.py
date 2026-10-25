@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import threading
 import time
+import ctypes
+from ctypes import wintypes
 
 import win32api
 import win32con
@@ -99,6 +101,22 @@ def clamp_to_screen(x: int, y: int, w: int, h: int) -> tuple[int, int]:
     return x, y
 
 
+def visible_window_rect(hwnd: int) -> tuple[int, int, int, int]:
+    """Return the painted frame bounds, excluding Windows' invisible resize border."""
+    try:
+        rect = wintypes.RECT()
+        # DWMWA_EXTENDED_FRAME_BOUNDS = 9. GetWindowRect includes invisible
+        # DWM resize margins, which look like a gap when two windows are docked.
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            wintypes.HWND(hwnd), 9, ctypes.byref(rect), ctypes.sizeof(rect)
+        )
+        if result == 0 and rect.right > rect.left and rect.bottom > rect.top:
+            return rect.left, rect.top, rect.right, rect.bottom
+    except Exception:
+        pass
+    return win32gui.GetWindowRect(hwnd)
+
+
 class Docking:
     """后台线程：每 120ms 跟随一次微信窗口。"""
 
@@ -142,7 +160,7 @@ class Docking:
                         continue
                     make_no_activate(self.sidebar_hwnd, self.no_activate)
 
-                left, top, right, bottom = win32gui.GetWindowRect(wx_hwnd)
+                left, top, right, bottom = visible_window_rect(wx_hwnd)
                 w, h = right - left, bottom - top
                 if w <= 0 or h <= 0 or win32gui.IsIconic(wx_hwnd):
                     win32gui.ShowWindow(self.sidebar_hwnd, win32con.SW_HIDE)

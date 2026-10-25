@@ -1,31 +1,55 @@
 from .base import BaseAdapter
 from .mock_adapter import MockAdapter
 from .qq_adapter import QQAdapter
+from .wechat4_adapter import WeChat4Adapter, _process_image_name
 
-__all__ = ['BaseAdapter', 'MockAdapter', 'QQAdapter']
+__all__ = ['BaseAdapter', 'MockAdapter', 'QQAdapter', 'WeChat4Adapter']
 
 
 def create_adapter(prefer: str = 'auto') -> BaseAdapter:
-    """按优先级创建 Adapter：**qq（默认目标 IM）-> wxauto -> mock**。
-
-    - `qq`：QQ NT 半自动（剪贴板读消息 + 激活窗口粘贴），不要求窗口已启动
-    - `wxauto`：微信 3.9.11.17（本机微信为 4.x，实际不可用，保留兼容）
-    - `mock`：演示数据，永远可用，作为最后兜底
-    """
-    if prefer in ('auto', 'qq'):
+    """Create the explicitly selected adapter, or auto-select the foreground IM."""
+    if prefer == 'wechat4':
+        return WeChat4Adapter()
+    if prefer == 'qq':
+        return QQAdapter()
+    if prefer == 'auto':
         try:
-            return QQAdapter()
-        except Exception as e:
-            if prefer == 'qq':
-                raise
-            print(f'[adapter] QQ adapter 不可用，尝试下一个：{type(e).__name__}: {e}')
-    if prefer in ('auto', 'wxauto'):
-        try:
-            from .wxauto_adapter import WxautoAdapter
+            import win32gui
+            import win32process
 
-            return WxautoAdapter()
-        except Exception as e:  # 微信没开 / 版本不对 / 没装 wxauto
-            if prefer == 'wxauto':
-                raise
-            print(f'[adapter] wxauto 不可用，降级 mock：{type(e).__name__}: {e}')
+            foreground = win32gui.GetForegroundWindow()
+            title = (win32gui.GetWindowText(foreground) or '').lower()
+            _thread, pid = win32process.GetWindowThreadProcessId(foreground)
+            image_name = _process_image_name(pid)
+            if image_name == 'weixin.exe' or '微信' in title:
+                return WeChat4Adapter()
+            if image_name in {'qq.exe', 'qqnt.exe'} or title == 'qq' or title.startswith('qq '):
+                return QQAdapter()
+            active_im = []
+
+            def visit(hwnd, _):
+                if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                    return
+                try:
+                    _thread, window_pid = win32process.GetWindowThreadProcessId(hwnd)
+                    name = _process_image_name(window_pid)
+                    if name == 'weixin.exe':
+                        active_im.append('wechat4')
+                    elif name in {'qq.exe', 'qqnt.exe'}:
+                        active_im.append('qq')
+                except Exception:
+                    pass
+
+            win32gui.EnumWindows(visit, None)
+            if active_im and active_im[0] == 'wechat4':
+                return WeChat4Adapter()
+            if active_im and active_im[0] == 'qq':
+                return QQAdapter()
+        except Exception:
+            pass
+        return QQAdapter()
+    if prefer == 'wxauto':
+        from .wxauto_adapter import WxautoAdapter
+
+        return WxautoAdapter()
     return MockAdapter()

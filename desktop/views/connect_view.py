@@ -8,13 +8,13 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QToolButton, QVBoxLayout, QWidget, QStyleFactory
 
-from theme import BRAND, ERROR, PANEL, SUB, TEXT, WARN
+from theme import BRAND, ERROR, LINE, PANEL, SUB, TEXT, WARN, palette
 
 HINT_TEXT = (
-    'QQ 半自动模式：在 QQ 里选中对方的话按 Ctrl+C，再点侧边栏【刷新】即可读到消息；\n'
-    '发送时会把 QQ 拉到前台粘贴（回车由你手动按）。打包版把 .env 放在 exe 同目录。'
+    '选择 QQ、微信或自动识别。QQ 与微信 4.x 使用本地 OCR 读取当前可见聊天区；\n'
+    '生成结果先放入回复框，填入或发送由你确认。请保持目标聊天窗口可见。'
 )
 
 
@@ -25,10 +25,12 @@ class ConnectView(QWidget):
     continue_clicked = Signal()
     refresh_requested = Signal()
     close_clicked = Signal()
+    platform_changed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName('connectView')
+        self._palette = palette('qq')
 
         self.lblIcon = QLabel('●')
         self.lblIcon.setObjectName('lblIcon')
@@ -37,6 +39,17 @@ class ConnectView(QWidget):
         self.lblTitle = QLabel('正在连接后端…')
         self.lblTitle.setObjectName('lblTitle')
         self.lblTitle.setStyleSheet(f'font-size: 15px; font-weight: 600; color: {TEXT};')
+
+        self.cmbPlatform = QComboBox()
+        self.cmbPlatform.setObjectName('cmbPlatform')
+        self.cmbPlatform.setStyle(QStyleFactory.create('Fusion'))
+        self.cmbPlatform.addItem('自动', 'auto')
+        self.cmbPlatform.addItem('QQ', 'qq')
+        self.cmbPlatform.addItem('微信', 'wechat4')
+        self.cmbPlatform.setToolTip('选择要连接的聊天平台')
+        self.cmbPlatform.currentIndexChanged.connect(
+            lambda _index: self.platform_changed.emit(self.cmbPlatform.currentData())
+        )
 
         self.btnClose = QToolButton()
         self.btnClose.setObjectName('btnClose')
@@ -48,6 +61,7 @@ class ConnectView(QWidget):
         head.addWidget(self.lblIcon)
         head.addSpacing(6)
         head.addWidget(self.lblTitle)
+        head.addWidget(self.cmbPlatform)
         head.addStretch(1)
         head.addWidget(self.btnClose)
 
@@ -59,8 +73,8 @@ class ConnectView(QWidget):
         self.lblHint = QLabel(HINT_TEXT)
         self.lblHint.setObjectName('lblHint')
         self.lblHint.setStyleSheet(
-            f'color: {SUB}; background: {PANEL}; border: 1px solid #242a34; '
-            f'border-radius: 8px; padding: 8px; font-size: 11px;'
+            f'color: {SUB}; background: {PANEL}; border: 1px solid {LINE}; '
+            f'border-radius: 10px; padding: 9px 10px; font-size: 11px;'
         )
         self.lblHint.setWordWrap(True)
 
@@ -79,8 +93,8 @@ class ConnectView(QWidget):
         btns.addStretch(1)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 18, 16, 18)
-        root.setSpacing(10)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
         root.addLayout(head)
         root.addWidget(self.lblDetail)
         root.addWidget(self.lblHint)
@@ -88,8 +102,17 @@ class ConnectView(QWidget):
         root.addStretch(1)
 
     # ---------------- 三态渲染 ----------------
+    def set_mode(self, mode: str) -> None:
+        self._palette = palette(mode)
+        self.lblTitle.setStyleSheet(f"font-size:15px;font-weight:600;color:{self._palette['text']};")
+        self.lblDetail.setStyleSheet(f"color:{self._palette['sub']};")
+        self.lblHint.setStyleSheet(
+            f"color:{self._palette['sub']};background:{self._palette['panel']}; "
+            f"border:1px solid {self._palette['line']};border-radius:10px;padding:9px 10px;font-size:11px;"
+        )
+
     def show_loading(self) -> None:
-        self.lblIcon.setStyleSheet(f'color: {SUB}; font-size: 20px;')
+        self.lblIcon.setStyleSheet(f"color:{self._palette['sub']};font-size:20px;")
         self.lblTitle.setText('正在连接后端…')
         self.lblDetail.setText('正在请求 /api/status')
         self.btnRetry.setEnabled(False)
@@ -97,7 +120,7 @@ class ConnectView(QWidget):
 
     def show_error(self, message: str) -> None:
         """网络异常 / 信封异常：给可读文案，不显示堆栈。"""
-        self.lblIcon.setStyleSheet(f'color: {ERROR}; font-size: 20px;')
+        self.lblIcon.setStyleSheet(f"color:{self._palette['error']};font-size:20px;")
         self.lblTitle.setText('后端未启动')
         self.lblDetail.setText(message)
         self.btnRetry.setEnabled(True)
@@ -106,27 +129,36 @@ class ConnectView(QWidget):
     def show_status(self, data: dict) -> None:
         """GET /api/status 成功：按 PRD §3 V0 状态映射表渲染。"""
         mode = data.get('mode')
+        index = self.cmbPlatform.findData(data.get('selected_adapter') or mode)
+        if index >= 0 and index != self.cmbPlatform.currentIndex():
+            self.cmbPlatform.blockSignals(True)
+            self.cmbPlatform.setCurrentIndex(index)
+            self.cmbPlatform.blockSignals(False)
         nickname = data.get('nickname') or 'QQ 侧边栏'
         running = bool(data.get('wechat_running'))
 
         if mode == 'qq' and running:
-            self.lblIcon.setStyleSheet(f'color: {BRAND}; font-size: 20px;')
-            self.lblTitle.setText('QQ 已就绪（半自动模式）')
+            self.lblIcon.setStyleSheet(f"color:{self._palette['brand']};font-size:20px;")
+            self.lblTitle.setText('QQ 已就绪（本地 OCR）')
             self.btnContinue.hide()
         elif mode == 'qq':
-            self.lblIcon.setStyleSheet(f'color: {WARN}; font-size: 20px;')
+            self.lblIcon.setStyleSheet(f"color:{self._palette['warn']};font-size:20px;")
             self.lblTitle.setText('QQ 未运行')
             self.btnContinue.show()
-        elif mode == 'wxauto' and running:
-            self.lblIcon.setStyleSheet(f'color: {BRAND}; font-size: 20px;')
-            self.lblTitle.setText(f'已连接 {nickname}')
+        elif mode == 'wechat4' and data.get('client_found') and not running:
+            self.lblIcon.setStyleSheet(f"color:{self._palette['warn']};font-size:20px;")
+            self.lblTitle.setText('微信窗口已最小化')
+            self.btnContinue.show()
+        elif mode in ('wxauto', 'wechat4') and running:
+            self.lblIcon.setStyleSheet(f"color:{self._palette['brand']};font-size:20px;")
+            self.lblTitle.setText(f'已连接 {nickname}' if mode == 'wxauto' else '微信 4.x 已就绪（本地 OCR）')
             self.btnContinue.hide()
-        elif mode == 'wxauto':
-            self.lblIcon.setStyleSheet(f'color: {WARN}; font-size: 20px;')
+        elif mode in ('wxauto', 'wechat4'):
+            self.lblIcon.setStyleSheet(f"color:{self._palette['warn']};font-size:20px;")
             self.lblTitle.setText('微信未运行')
             self.btnContinue.show()
         else:
-            self.lblIcon.setStyleSheet(f'color: {WARN}; font-size: 20px;')
+            self.lblIcon.setStyleSheet(f"color:{self._palette['warn']};font-size:20px;")
             self.lblTitle.setText('演示数据')
             self.btnContinue.show()
 

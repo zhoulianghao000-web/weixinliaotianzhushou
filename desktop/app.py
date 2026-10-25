@@ -8,6 +8,10 @@ from __future__ import annotations
 import socket
 import sys
 import threading
+import os
+import json
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 DESKTOP_DIR = Path(__file__).resolve().parent
@@ -49,15 +53,57 @@ def port_open(host: str, port: int, timeout: float = 0.4) -> bool:
         return False
 
 
+def backend_compatible(host: str, port: int, timeout: float = 0.6) -> bool:
+    """Do not reuse a stale backend just because something listens on the port."""
+    api_host = '127.0.0.1' if host in {'0.0.0.0', '::'} else host
+    try:
+        def get_json(path: str) -> dict:
+            with urllib.request.urlopen(f'http://{api_host}:{port}{path}', timeout=timeout) as response:
+                return json.loads(response.read().decode('utf-8'))
+
+        status = get_json('/api/status')
+        products = get_json('/api/products')
+        status_data = status.get('data') or {}
+        product_data = products.get('data') or {}
+        return (
+            status.get('code') == 0
+            and 'selected_adapter' in status_data
+            and 'client_running' in status_data
+            and products.get('code') == 0
+            and isinstance(product_data.get('items'), list)
+        )
+    except Exception:
+        return False
+
+
 def start_embedded_backend() -> bool:
     """端口空闲才起内嵌后端；已有人在跑就复用，避免抢端口。返回是否由本进程启动。"""
     try:
         import config
     except Exception:
         return False
-    if port_open(config.HOST, config.PORT):
-        print(f'[app] 复用已运行的后端 {config.HOST}:{config.PORT}')
-        return False
+    preferred_port = config.PORT
+    if port_open(config.HOST, preferred_port):
+        if backend_compatible(config.HOST, preferred_port):
+            api_host = '127.0.0.1' if config.HOST in {'0.0.0.0', '::'} else config.HOST
+            os.environ['SIDEBAR_API'] = f'http://{api_host}:{preferred_port}'
+            print(f'[app] 复用兼容后端 {api_host}:{preferred_port}')
+            return False
+        # A previous app version may still own the default port. Keep it intact
+        # and start this package's embedded backend on the next free local port.
+        config.PORT = next(
+            (candidate for candidate in range(preferred_port + 1, preferred_port + 41)
+             if not port_open(config.HOST, candidate)),
+            0,
+        )
+        if not config.PORT:
+            print('[app] 默认端口被旧服务占用，且备用端口均不可用')
+            return False
+        print(f'[app] 默认端口有不兼容服务，改用 {config.PORT}')
+
+    api_host = '127.0.0.1' if config.HOST in {'0.0.0.0', '::'} else config.HOST
+    os.environ['SIDEBAR_PORT'] = str(config.PORT)
+    os.environ['SIDEBAR_API'] = f'http://{api_host}:{config.PORT}'
 
     def run() -> None:
         try:
@@ -77,12 +123,12 @@ def main() -> None:
     _redirect_stdio()
     started = start_embedded_backend()
     if started:
-        # 等等后端就绪，否则首屏会闪一下"后端未启动"
+        # 等后端接口就绪，否则首屏会闪一下"后端未启动"。
         for _ in range(60):
             try:
                 import config
 
-                if port_open(config.HOST, config.PORT):
+                if backend_compatible(config.HOST, config.PORT, timeout=0.3):
                     break
             except Exception:
                 break
@@ -91,6 +137,10 @@ def main() -> None:
             time.sleep(0.1)
 
     app = QApplication(sys.argv)
+    # Auxiliary dialogs (for example, confirmation/error dialogs) must not
+    # terminate the floating sidebar when they are dismissed. The sidebar's
+    # own close button calls QApplication.quit() explicitly.
+    app.setQuitOnLastWindowClosed(False)
     app.setStyleSheet(theme.QSS)
 
     win = SidebarWindow()

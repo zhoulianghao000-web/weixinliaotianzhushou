@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from theme import BRAND, BRAND_DARK, ERROR, LINE, PANEL, SUB, TEXT, WARN
+from theme import BRAND, BRAND_DARK, ERROR, LINE, PANEL, SUB, TEXT, WARN, palette
 
 
 class QuickView(QWidget):
@@ -29,6 +29,7 @@ class QuickView(QWidget):
         super().__init__(parent)
         self.setObjectName('quickView')
         self._items: list[dict] = []
+        self._palette = palette('qq')
 
         self.btnBack = QToolButton()
         self.btnBack.setText('←')
@@ -96,8 +97,8 @@ class QuickView(QWidget):
         self.lblToast.hide()
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(8)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(9)
         root.addLayout(head)
         root.addWidget(self.listQuick, 1)
         root.addWidget(self.lblEmpty)
@@ -105,8 +106,19 @@ class QuickView(QWidget):
         root.addLayout(row_add)
         root.addLayout(row_tag)
         root.addWidget(self.lblToast)
+        self.set_mode('qq')
 
     # ---------------- 数据渲染 ----------------
+    def set_mode(self, mode: str) -> None:
+        self._palette = palette(mode)
+        self.lblTitle.setStyleSheet(f"font-size:15px;font-weight:600;color:{self._palette['text']};")
+        self.lblEmpty.setStyleSheet(f"color:{self._palette['sub']};font-size:12px;")
+        self.listQuick.setStyleSheet(
+            f"QListWidget{{background:{self._palette['panel']};border:1px solid {self._palette['line']};border-radius:12px;}}"
+            'QListWidget::item{padding:9px;border-radius:8px;}'
+            f"QListWidget::item:selected{{background:{self._palette['brand_dark']};color:#ffffff;}}"
+        )
+
     def set_items(self, items: list) -> None:
         self._items = items or []
         tags = ['全部'] + sorted({str(it.get('tag') or '常用') for it in self._items})
@@ -171,10 +183,13 @@ class QuickView(QWidget):
         self.inputTag.clear()
 
     def toast(self, message: str, level: str = 'ok') -> None:
-        color = {'ok': BRAND, 'warn': WARN, 'error': ERROR}.get(level, TEXT)
+        color = {
+            'ok': self._palette['brand'], 'warn': self._palette['warn'],
+            'error': self._palette['error'],
+        }.get(level, self._palette['text'])
         self.lblToast.setStyleSheet(
-            f'background: {PANEL}; color: {color}; border: 1px solid {LINE}; '
-            f'border-radius: 6px; padding: 6px; font-size: 11px;'
+            f"background:{self._palette['panel']};color:{color};border:1px solid {self._palette['line']};"
+            'border-radius:10px;padding:7px 9px;font-size:11px;'
         )
         self.lblToast.setText(message)
         self.lblToast.show()

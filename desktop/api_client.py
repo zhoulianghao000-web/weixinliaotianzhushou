@@ -63,12 +63,16 @@ class ApiClient:
             params['limit'] = limit
         return self.unwrap(self._request('GET', '/api/messages', params=params))
 
-    def reply(self, who: str | None, instruction: str = '', messages: list | None = None) -> dict:
+    def reply(self, who: str | None, instruction: str = '', messages: list | None = None,
+              product_id: int | None = None) -> dict:
+        body = {'who': who, 'instruction': instruction, 'messages': messages}
+        if product_id is not None:
+            body['product_id'] = product_id
         return self.unwrap(
             self._request(
                 'POST',
                 '/api/reply',
-                json={'who': who, 'instruction': instruction, 'messages': messages},
+                json=body,
                 timeout=30.0,
             )
         )
@@ -107,6 +111,34 @@ class ApiClient:
     def delete_quick_reply(self, qid: int) -> dict:
         return self.unwrap(self._request('DELETE', f'/api/quick-replies/{qid}'))
 
+    # ---------- V4 产品库 / 本地 RAG ----------
+    def products(self) -> dict:
+        return self.unwrap(self._request('GET', '/api/products'))
+
+    def add_product(self, name: str, category: str = '', summary: str = '') -> dict:
+        return self.unwrap(self._request(
+            'POST', '/api/products', json={'name': name, 'category': category, 'summary': summary}
+        ))
+
+    def update_product(self, product_id: int, **fields) -> dict:
+        return self.unwrap(self._request('PUT', f'/api/products/{product_id}', json=fields))
+
+    def delete_product(self, product_id: int) -> dict:
+        return self.unwrap(self._request('DELETE', f'/api/products/{product_id}'))
+
+    def product_documents(self, product_id: int) -> dict:
+        return self.unwrap(self._request('GET', f'/api/products/{product_id}/documents'))
+
+    def import_product_folder(self, product_id: int, source_dir: str) -> dict:
+        return self.unwrap(self._request(
+            'POST', f'/api/products/{product_id}/documents/import',
+            json={'source_dir': source_dir}, timeout=3600.0,
+        ))
+
+    def delete_product_document(self, product_id: int, document_id: int) -> dict:
+        return self.unwrap(self._request(
+            'DELETE', f'/api/products/{product_id}/documents/{document_id}'
+        ))
 
 class ApiWorker(QThread):
     """把任意 ApiClient 调用放到子线程；结果通过 Signal 回主线程（CLAUDE.md §7.4）。"""

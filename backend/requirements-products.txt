@@ -1,0 +1,8 @@
+# Optional local document processing for the product library.
+# MinerU is run in local mode only; its first OCR parse downloads model weights locally.
+mineru>=4.0,<5
+PyMuPDF>=1.26,<2
+pypdf>=6,<7
+python-docx>=1.2,<2
+python-pptx>=1.0,<2
+openpyxl>=3.1,<4

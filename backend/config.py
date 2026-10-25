@@ -54,6 +54,7 @@ TARGET_TITLE = _str('SIDEBAR_TARGET_TITLE', 'QQ')
 
 # ---- 数据库 ----
 DB_PATH = Path(os.getenv('SIDEBAR_DB', '') or (ROOT / 'data' / 'sidebar.db'))
+PRODUCTS_PATH = DB_PATH.parent / 'products'
 
 # ---- LLM ----
 OPENAI_API_KEY = _str('OPENAI_API_KEY', '')

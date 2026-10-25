@@ -5,23 +5,42 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
+    QComboBox,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QStackedWidget,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QStyleFactory,
 )
 
-from theme import BRAND, BRAND_DARK, ERROR, LINE, PANEL, SUB, TEXT, WARN
+from theme import BRAND, BRAND_DARK, ERROR, LINE, PANEL, SUB, TEXT, WARN, palette
 
 TYPE_SYS = ('sys', 'time', 'recall')
+
+
+class UpwardComboBox(QComboBox):
+    """Show the platform picker above its control when it is opened."""
+
+    def showPopup(self) -> None:
+        super().showPopup()
+        popup = self.view().window()
+        top = self.mapToGlobal(QPoint(0, 0)).y()
+        popup_height = popup.frameGeometry().height()
+        screen = self.screen()
+        available = screen.availableGeometry() if screen else None
+        popup_y = top - popup_height - 2
+        if available is not None and popup_y < available.top():
+            popup_y = available.top()
+        popup.move(popup.x(), popup_y)
 
 
 class MainView(QWidget):
@@ -36,24 +55,35 @@ class MainView(QWidget):
     close_clicked = Signal()
     settings_clicked = Signal()
     quick_clicked = Signal()
+    products_clicked = Signal()
+    platform_changed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName('mainView')
         self._docking = False
         self._listen = False
+        self._palette = palette('qq')
+        self._theme_mode = 'qq'
+        self._hide_sessions = False
+        self._selected_product_id: int | None = None
+        self._selected_product_name = ''
+        self._current_messages: list[dict] = []
         # setItemWidget 不会持有 Python 引用，必须在实例上保留，否则控件被 GC 掉
         self._bubbles: list[QWidget] = []
 
         # ---------- 顶部状态条 ----------
-        self.lblNickname = QLabel('微信侧边栏')
-        self.lblNickname.setObjectName('lblNickname')
-        self.lblNickname.setStyleSheet(f'font-size: 14px; font-weight: 600; color: {TEXT};')
-
-        self.lblMode = QLabel('演示数据')
-        self.lblMode.setObjectName('lblMode')
-        self.lblMode.setStyleSheet(f'color: {WARN}; font-size: 11px;')
-
+        self.cmbPlatform = UpwardComboBox()
+        self.cmbPlatform.setObjectName('cmbPlatform')
+        self.cmbPlatform.setStyle(QStyleFactory.create('Fusion'))
+        self.cmbPlatform.setFixedSize(84, 32)
+        self.cmbPlatform.addItem('自动', 'auto')
+        self.cmbPlatform.addItem('QQ', 'qq')
+        self.cmbPlatform.addItem('微信', 'wechat4')
+        self.cmbPlatform.setToolTip('选择当前识别和回复的平台')
+        self.cmbPlatform.currentIndexChanged.connect(
+            lambda _index: self.platform_changed.emit(self.cmbPlatform.currentData())
+        )
         self.btnSettings = QToolButton()
         self.btnSettings.setObjectName('btnSettings')
         self.btnSettings.setText('⚙')
@@ -66,6 +96,12 @@ class MainView(QWidget):
         self.btnQuick.setToolTip('话术库：点一条插入回复框')
         self.btnQuick.clicked.connect(self.quick_clicked.emit)
 
+        self.btnProducts = QToolButton()
+        self.btnProducts.setObjectName('btnProducts')
+        self.btnProducts.setText('▦')
+        self.btnProducts.setToolTip('产品库：管理产品资料并用于回复检索')
+        self.btnProducts.clicked.connect(self.products_clicked.emit)
+
         self.btnClose = QToolButton()
         self.btnClose.setObjectName('btnClose')
         self.btnClose.setText('✕')
@@ -73,10 +109,10 @@ class MainView(QWidget):
         self.btnClose.clicked.connect(self.close_clicked.emit)
 
         top = QHBoxLayout()
-        top.addWidget(self.lblNickname)
-        top.addWidget(self.lblMode)
+        top.addWidget(self.cmbPlatform)
         top.addStretch(1)
         top.addWidget(self.btnQuick)
+        top.addWidget(self.btnProducts)
         top.addWidget(self.btnSettings)
         top.addWidget(self.btnClose)
 
@@ -91,21 +127,23 @@ class MainView(QWidget):
 
         # ---------- 会话区 ----------
         self.lblSessionTitle = QLabel('会话')
-        self.lblSessionTitle.setStyleSheet(f'color: {SUB}; font-size: 11px;')
+        self.lblSessionTitle.setStyleSheet(f'color: {SUB}; font-size: 11px; font-weight: 600;')
 
         self.btnRefreshSession = QToolButton()
         self.btnRefreshSession.setObjectName('btnRefreshSession')
         self.btnRefreshSession.setText('↻')
         self.btnRefreshSession.clicked.connect(self.refresh_sessions_clicked.emit)
 
-        head_session = QHBoxLayout()
+        self.sessionHeader = QWidget()
+        head_session = QHBoxLayout(self.sessionHeader)
+        head_session.setContentsMargins(0, 0, 0, 0)
         head_session.addWidget(self.lblSessionTitle)
         head_session.addStretch(1)
         head_session.addWidget(self.btnRefreshSession)
 
         self.listSessions = QListWidget()
         self.listSessions.setObjectName('listSessions')
-        self.listSessions.setFixedHeight(128)
+        self.listSessions.setFixedHeight(116)
         self.listSessions.setStyleSheet(
             f'QListWidget {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 8px; }}'
             f'QListWidget::item {{ padding: 6px 8px; }}'
@@ -134,13 +172,18 @@ class MainView(QWidget):
         self.lblMsgEmpty.setObjectName('lblMsgEmpty')
         self.lblMsgEmpty.setStyleSheet(f'color: {SUB}; font-size: 12px;')
         self.lblMsgEmpty.setAlignment(Qt.AlignCenter)
-        self.lblMsgEmpty.hide()
+        self.lblMsgEmpty.setWordWrap(True)
 
         self.lblMsgLoading = QLabel('加载中…')
         self.lblMsgLoading.setObjectName('lblMsgLoading')
         self.lblMsgLoading.setStyleSheet(f'color: {SUB}; font-size: 12px;')
         self.lblMsgLoading.setAlignment(Qt.AlignCenter)
-        self.lblMsgLoading.hide()
+        self.messageStack = QStackedWidget()
+        self.messageStack.setObjectName('messageStack')
+        self.messageStack.addWidget(self.listMessages)
+        self.messageStack.addWidget(self.lblMsgEmpty)
+        self.messageStack.addWidget(self.lblMsgLoading)
+        self.messageStack.setCurrentWidget(self.lblMsgEmpty)
 
         # ---------- 回复区 ----------
         self.inputInstruction = QLineEdit()
@@ -165,6 +208,8 @@ class MainView(QWidget):
         self.lblSource = QLabel('')
         self.lblSource.setObjectName('lblSource')
         self.lblSource.setStyleSheet(f'color: {SUB}; font-size: 11px;')
+        self.lblProductContext = QLabel('')
+        self.lblProductContext.setStyleSheet(f'color: {SUB}; font-size: 10px;')
 
         self.btnFill = QPushButton('填入')
         self.btnFill.setObjectName('btnFill')
@@ -184,11 +229,15 @@ class MainView(QWidget):
         self.btnDock = QPushButton('贴边（关）')
         self.btnDock.setObjectName('btnDock')
         self.btnDock.setCheckable(True)
+        self.btnDock.setMinimumWidth(104)
+        self.btnDock.setCursor(Qt.PointingHandCursor)
         self.btnDock.clicked.connect(lambda: self.dock_toggled.emit(self.btnDock.isChecked()))
 
         self.btnListen = QPushButton('实时监听（关）')
         self.btnListen.setObjectName('btnListen')
         self.btnListen.setCheckable(True)
+        self.btnListen.setMinimumWidth(126)
+        self.btnListen.setCursor(Qt.PointingHandCursor)
         self.btnListen.clicked.connect(lambda: self.listen_toggled.emit(self.btnListen.isChecked()))
 
         row_sw = QHBoxLayout()
@@ -203,19 +252,18 @@ class MainView(QWidget):
         self.lblToast.hide()
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(8)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(9)
         root.addLayout(top)
         root.addWidget(self.bannerNotice)
-        root.addLayout(head_session)
+        root.addWidget(self.sessionHeader)
         root.addWidget(self.listSessions)
         root.addWidget(self.lblSessionEmpty)
-        root.addWidget(self.listMessages, 1)
-        root.addWidget(self.lblMsgEmpty)
-        root.addWidget(self.lblMsgLoading)
+        root.addWidget(self.messageStack, 1)
         root.addLayout(row_inst)
         root.addWidget(self.editReply)
         root.addWidget(self.lblSource)
+        root.addWidget(self.lblProductContext)
         root.addLayout(row_send)
         root.addLayout(row_sw)
         root.addWidget(self.lblToast)
@@ -225,19 +273,33 @@ class MainView(QWidget):
     # ---------------- 状态条 ----------------
     def set_status(self, data: dict) -> None:
         mode = data.get('mode')
-        self.lblNickname.setText(data.get('nickname') or '微信侧边栏')
-        if mode == 'qq':
-            self.lblMode.setText('QQ 半自动')
-            self.lblMode.setStyleSheet(f'color: {BRAND}; font-size: 11px;')
-        elif mode == 'wxauto':
-            self.lblMode.setText('已连微信')
-            self.lblMode.setStyleSheet(f'color: {BRAND}; font-size: 11px;')
-        else:
-            self.lblMode.setText('演示数据')
-            self.lblMode.setStyleSheet(f'color: {WARN}; font-size: 11px;')
-
+        old_theme_mode = self._theme_mode
+        selected_adapter = data.get('selected_adapter') or mode
+        index = self.cmbPlatform.findData(selected_adapter)
+        if index >= 0 and index != self.cmbPlatform.currentIndex():
+            self.cmbPlatform.blockSignals(True)
+            self.cmbPlatform.setCurrentIndex(index)
+            self.cmbPlatform.blockSignals(False)
+        self._palette = palette(mode or 'qq')
+        new_theme_mode = 'wechat' if mode in ('wechat', 'wechat4', 'wxauto') else 'qq'
+        self._theme_mode = new_theme_mode
+        if old_theme_mode != new_theme_mode and self._current_messages:
+            self.set_messages(self._current_messages)
+        # QQ and WeChat 4.x expose only the currently visible chat, not a real
+        # conversation list. Hide the fake session panel for both adapters.
+        self._hide_sessions = mode in ('qq', 'wechat4')
+        self.sessionHeader.setVisible(not self._hide_sessions)
+        self.listSessions.setVisible(not self._hide_sessions)
+        self.lblSessionEmpty.setVisible(not self._hide_sessions and self.listSessions.count() == 0)
+        self.bannerNotice.setStyleSheet(
+            f"background:{self._palette['panel']}; color:{self._palette['warn']}; "
+            f"border:1px solid {self._palette['line']}; border-radius:10px; padding:8px 10px; font-size:11px;"
+        )
+        self.lblSessionTitle.setStyleSheet(f"color:{self._palette['sub']};font-size:11px;")
+        for label in (self.lblSessionEmpty, self.lblMsgEmpty, self.lblMsgLoading, self.lblSource, self.lblProductContext):
+            label.setStyleSheet(f"color:{self._palette['sub']};font-size:11px;")
         detail = data.get('detail') or ''
-        notice = ('' if (mode == 'wxauto' and data.get('wechat_running')) else detail)
+        notice = ('' if (mode in ('wxauto', 'wechat4') and data.get('wechat_running')) else detail)
         self.bannerNotice.setText(notice)
         self.bannerNotice.setVisible(bool(notice))
 
@@ -247,6 +309,11 @@ class MainView(QWidget):
         self.btnDock.setText(f'贴边（{"开" if self._docking else "关"}）')
         self.btnListen.setChecked(self._listen)
         self.btnListen.setText(f'实时监听（{"开" if self._listen else "关"}）')
+        self.listSessions.setStyleSheet(
+            f"QListWidget {{ background: {self._palette['panel']}; border: 1px solid {self._palette['line']}; border-radius: 8px; }}"
+            f"QListWidget::item {{ padding: 6px 8px; }}"
+            f"QListWidget::item:selected {{ background: {self._palette['brand_dark']}; color: #ffffff; }}"
+        )
 
     def set_docking(self, on: bool) -> None:
         self._docking = on
@@ -278,7 +345,7 @@ class MainView(QWidget):
         self.listSessions.clear()
         if not sessions:
             self.lblSessionEmpty.setText('暂无会话')
-            self.lblSessionEmpty.show()
+            self.lblSessionEmpty.setVisible(not self._hide_sessions)
             return
         self.lblSessionEmpty.hide()
         for s in sessions:
@@ -289,6 +356,7 @@ class MainView(QWidget):
             tip = f'{s.get("time") or ""} {s.get("content") or ""}'.strip()
             item.setToolTip(tip or name)
             self.listSessions.addItem(item)
+        self.listSessions.setVisible(not self._hide_sessions)
 
     def select_session(self, who: str) -> None:
         for i in range(self.listSessions.count()):
@@ -299,25 +367,26 @@ class MainView(QWidget):
 
     # ---------------- 消息区 ----------------
     def show_messages_loading(self) -> None:
-        self.listMessages.hide()
-        self.lblMsgEmpty.hide()
-        self.lblMsgLoading.show()
+        if self._current_messages:
+            self.messageStack.setCurrentWidget(self.listMessages)
+        else:
+            self.messageStack.setCurrentWidget(self.lblMsgLoading)
 
     def show_messages_empty(self, hint: str | None = None) -> None:
-        self.lblMsgLoading.hide()
-        self.listMessages.hide()
+        if self._current_messages:
+            self.messageStack.setCurrentWidget(self.listMessages)
+            return
         self.lblMsgEmpty.setText(hint or '暂无消息')
-        self.lblMsgEmpty.show()
+        self.messageStack.setCurrentWidget(self.lblMsgEmpty)
 
     def set_messages(self, messages: list) -> None:
-        self.lblMsgLoading.hide()
-        self.listMessages.show()
+        self._current_messages = list(messages or [])
         self.listMessages.clear()
         self._bubbles.clear()
         if not messages:
             self.show_messages_empty()
             return
-        self.lblMsgEmpty.hide()
+        self.messageStack.setCurrentWidget(self.listMessages)
         for m in messages:
             self._add_bubble(m)
         self.listMessages.scrollToBottom()
@@ -325,9 +394,8 @@ class MainView(QWidget):
     def append_messages(self, messages: list) -> None:
         if not messages:
             return
-        self.lblMsgLoading.hide()
-        self.lblMsgEmpty.hide()
-        self.listMessages.show()
+        self._current_messages.extend(messages)
+        self.messageStack.setCurrentWidget(self.listMessages)
         for m in messages:
             self._add_bubble(m)
         self.listMessages.scrollToBottom()
@@ -341,7 +409,10 @@ class MainView(QWidget):
             w = QLabel(text)
             w.setWordWrap(True)
             w.setAlignment(Qt.AlignCenter)
-            w.setStyleSheet(f'color: {SUB}; font-size: 11px; background: transparent; padding: 2px;')
+            w.setStyleSheet(
+                f"color: {self._palette['sub']}; font-size: 10px; background: {self._palette['brand_soft']}; "
+                'border-radius: 9px; padding: 4px 8px;'
+            )
             self._bubbles.append(w)
             self.listMessages.addItem(item)
             self.listMessages.setItemWidget(item, w)
@@ -351,12 +422,23 @@ class MainView(QWidget):
         is_self = mtype == 'self'
         bubble = QLabel(text)
         bubble.setWordWrap(True)
-        bubble.setMaximumWidth(250)
         bubble.setStyleSheet(
-            f'background: {BRAND_DARK}; color: #ffffff; border-radius: 8px; padding: 6px 8px;'
+            f"background: {self._palette['bubble_out']}; color: {self._palette['text']}; "
+            f"border: 1px solid {self._palette['line']}; border-radius: 13px; padding: 8px 10px; font-size: 14px;"
             if is_self
-            else f'background: {PANEL}; color: {TEXT}; border-radius: 8px; padding: 6px 8px;'
+            else f"background: {self._palette['panel']}; color: {self._palette['text']}; "
+                 f"border: 1px solid {self._palette['line']}; border-radius: 13px; padding: 8px 10px; font-size: 14px;"
         )
+        bubble.ensurePolished()
+        lines = text.splitlines() or [text]
+        natural_text_width = max(bubble.fontMetrics().horizontalAdvance(line) for line in lines)
+        # Keep a comfortably readable minimum while limiting long messages to
+        # the available sidebar width.
+        bubble_width = min(280, max(210, natural_text_width + 24))
+        bubble.setFixedWidth(bubble_width)
+        wrapped_height = max(bubble.sizeHint().height(), bubble.heightForWidth(bubble_width))
+        if wrapped_height > 0:
+            bubble.setMinimumHeight(wrapped_height)
 
         container = QWidget()
         lay = QHBoxLayout(container)
@@ -368,7 +450,7 @@ class MainView(QWidget):
             col = QVBoxLayout()
             if m.get('sender'):
                 name = QLabel(str(m['sender']))
-                name.setStyleSheet(f'color: {SUB}; font-size: 11px; background: transparent;')
+                name.setStyleSheet(f"color: {self._palette['sub']}; font-size: 11px; background: transparent;")
                 col.addWidget(name)
             col.addWidget(bubble)
             lay.addLayout(col)
@@ -380,7 +462,8 @@ class MainView(QWidget):
         item.setSizeHint(container.sizeHint())
 
     # ---------------- 回复区 ----------------
-    def set_reply(self, text: str, source: str = '') -> None:
+    def set_reply(self, text: str, source: str = '', product_sources: list[dict] | None = None,
+                  product_context_used: bool = True) -> None:
         self.editReply.setPlainText(text)
         if source == 'rule':
             self.lblSource.setText('来源：rule（规则兜底）')
@@ -388,6 +471,31 @@ class MainView(QWidget):
             self.lblSource.setText(f'来源：{source}')
         else:
             self.lblSource.setText('')
+        sources = product_sources or []
+        if sources:
+            labels = []
+            for item in sources:
+                label = str(item.get('document_name') or '产品资料')
+                page = item.get('page')
+                if page:
+                    label += f' p.{page}'
+                labels.append(label)
+            unique = list(dict.fromkeys(labels))
+            label = '产品依据：' if product_context_used else '检索到（本次兜底回复未采用）：'
+            self.lblProductContext.setText(label + '；'.join(unique[:3]))
+            self.lblProductContext.setToolTip('\n'.join(unique))
+        else:
+            self.lblProductContext.setText(
+                f'回复检索：{self._selected_product_name} · 本次未命中资料'
+                if self._selected_product_id else ''
+            )
+            self.lblProductContext.setToolTip('')
+
+    def set_selected_product(self, product_id: int | None, name: str = '') -> None:
+        self._selected_product_id = product_id
+        self._selected_product_name = name
+        self.lblProductContext.setText(f'回复检索：{name}' if product_id else '')
+        self.lblProductContext.setToolTip('已选择产品资料；生成后会显示命中的文件来源。' if product_id else '')
 
     def reply_text(self) -> str:
         return self.editReply.toPlainText().strip()
@@ -410,10 +518,12 @@ class MainView(QWidget):
 
     # ---------------- toast（非模态，不抢焦点）----------------
     def toast(self, message: str, level: str = 'info') -> None:
-        color = {'ok': BRAND, 'warn': WARN, 'error': ERROR}.get(level, TEXT)
+        color = {
+            'ok': self._palette['brand'], 'warn': self._palette['warn'], 'error': self._palette['error']
+        }.get(level, self._palette['text'])
         self.lblToast.setText(message)
         self.lblToast.setStyleSheet(
-            f'background: {PANEL}; color: {color}; border: 1px solid {LINE}; '
+            f"background: {self._palette['panel']}; color: {color}; border: 1px solid {self._palette['line']}; "
             f'border-radius: 6px; padding: 6px; font-size: 11px;'
         )
         self.lblToast.show()
